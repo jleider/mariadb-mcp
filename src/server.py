@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import argparse
+import re
 from typing import List, Dict, Any, Optional
 from functools import partial 
 
@@ -114,17 +115,14 @@ class MariaDBServer:
 
         allowed_prefixes = ('SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'USE')
         
-        def strip_sql_comments(query):
-            """Strip SQL comments from query string."""
-            import re
-            # Remove single-line comments (-- comment)
-            query = re.sub(r'--.*?$', '', query, flags=re.MULTILINE)
-            # Remove multi-line comments (/* comment */)
-            query = re.sub(r'/\*.*?\*/', '', query, flags=re.DOTALL)
-            return query.strip()
+        # Strip SQL comments from query
+        # Remove single-line comments (-- comment)
+        sql_no_comments = re.sub(r'--.*?$', '', sql, flags=re.MULTILINE)
+        # Remove multi-line comments (/* comment */)
+        sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
+        sql_no_comments = sql_no_comments.strip()
         
-        sql_no_comments = strip_sql_comments(sql)
-        query_upper = sql_no_comments.strip().upper()
+        query_upper = sql_no_comments.upper()
         is_allowed_read_query = any(query_upper.startswith(prefix) for prefix in allowed_prefixes)
 
         if self.is_read_only and not is_allowed_read_query:
@@ -150,7 +148,7 @@ class MariaDBServer:
                         logger.info(f"Switching database context from '{actual_current_db}' to '{database}'")
                         await cursor.execute(f"USE `{database}`")
 
-                    await cursor.execute(sql, params or ())
+                    await cursor.execute(sql_no_comments, params or ())
                     results = await cursor.fetchall()
                     logger.info(f"Query executed successfully, {len(results)} rows returned.")
                     return results if results else []
