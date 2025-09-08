@@ -113,7 +113,18 @@ class MariaDBServer:
             raise RuntimeError("Database connection pool not available.")
 
         allowed_prefixes = ('SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'USE')
-        query_upper = sql.strip().upper()
+        
+        def strip_sql_comments(query):
+            """Strip SQL comments from query string."""
+            import re
+            # Remove single-line comments (-- comment)
+            query = re.sub(r'--.*?$', '', query, flags=re.MULTILINE)
+            # Remove multi-line comments (/* comment */)
+            query = re.sub(r'/\*.*?\*/', '', query, flags=re.DOTALL)
+            return query.strip()
+        
+        sql_no_comments = strip_sql_comments(sql)
+        query_upper = sql_no_comments.strip().upper()
         is_allowed_read_query = any(query_upper.startswith(prefix) for prefix in allowed_prefixes)
 
         if self.is_read_only and not is_allowed_read_query:
