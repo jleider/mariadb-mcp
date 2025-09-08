@@ -126,7 +126,7 @@ class MariaDBServer:
         is_allowed_read_query = any(query_upper.startswith(prefix) for prefix in allowed_prefixes)
 
         if self.is_read_only and not is_allowed_read_query:
-             logger.warning(f"Blocked potentially non-read-only query in read-only mode FOOBAR BAZ: {query_upper[:100]}...")
+             logger.warning(f"Blocked potentially non-read-only query in read-only mode: {sql[:100]}...")
              raise PermissionError("Operation forbidden: Server is in read-only mode.")
 
         logger.info(f"Executing query (DB: {database or DB_NAME}): {sql[:100]}...")
