@@ -1,0 +1,12 @@
+.venv/
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+logs/
+src/logs/
+.env
+.DS_Store
+.claude/

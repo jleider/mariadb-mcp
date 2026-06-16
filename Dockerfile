@@ -7,8 +7,9 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*    
 
-# Install uv
-RUN pip install --no-cache-dir uv
+# Install uv, and refresh the base image's build tooling to clear known CVEs
+# in setuptools (which vendors jaraco.context) and wheel.
+RUN pip install --no-cache-dir --upgrade uv setuptools wheel
 
 # Set working directory
 WORKDIR /app
