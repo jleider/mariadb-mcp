@@ -57,38 +57,10 @@ DB_NAME = os.getenv("DB_NAME")
 MCP_READ_ONLY = os.getenv("MCP_READ_ONLY", "true").lower() == "true"
 MCP_MAX_POOL_SIZE = int(os.getenv("MCP_MAX_POOL_SIZE", 10))
 
-# --- Embedding Configuration ---
-# Provider selection ('openai' or 'gemini' or 'huggingface')
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER")
-EMBEDDING_PROVIDER = EMBEDDING_PROVIDER.lower() if EMBEDDING_PROVIDER else None
-# API Keys
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# Open models from Huggingface
-HF_MODEL = os.getenv("HF_MODEL")
-
 
 # --- Validation ---
 if not all([DB_USER, DB_PASSWORD]):
     logger.error("Database credentials (DB_USER, DB_PASSWORD) not found in environment variables or .env file.")
-
-# Embedding Provider and Keys
-logger.info(f"Selected Embedding Provider: {EMBEDDING_PROVIDER}")
-if EMBEDDING_PROVIDER == "openai":
-    if not OPENAI_API_KEY:
-        logger.error("EMBEDDING_PROVIDER is 'openai' but OPENAI_API_KEY is missing.")
-        raise ValueError("OpenAI API key is required when EMBEDDING_PROVIDER is 'openai'.")
-elif EMBEDDING_PROVIDER == "gemini":
-    if not GEMINI_API_KEY:
-        logger.error("EMBEDDING_PROVIDER is 'gemini' but GEMINI_API_KEY is missing.")
-        raise ValueError("Gemini API key is required when EMBEDDING_PROVIDER is 'gemini'.")
-elif EMBEDDING_PROVIDER == "huggingface":
-    if not HF_MODEL:
-        logger.error("EMBEDDING_PROVIDER is 'huggingface' but HF_MODEL is missing.")
-        raise ValueError("HuggingFace model is required when EMBEDDING_PROVIDER is 'huggingface'.")
-else:
-    EMBEDDING_PROVIDER = None
-    logger.info(f"No EMBEDDING_PROVIDER selected or it is set to None. Disabling embedding features.")
 
 logger.info(f"Read-only mode: {MCP_READ_ONLY}")
 logger.info(f"Logging to console and to file: {LOG_FILE_PATH} (Level: {LOG_LEVEL}, MaxSize: {LOG_MAX_BYTES}B, Backups: {LOG_BACKUP_COUNT})")
