@@ -1,6 +1,6 @@
 # MCP MariaDB Server
 
-The MCP MariaDB Server provides a Model Context Protocol (MCP) interface for managing and querying MariaDB databases, supporting both standard SQL operations and advanced vector/embedding-based search. Designed for use with AI assistants, it enables seamless integration of AI-driven data workflows with relational and vector databases.
+The MCP MariaDB Server provides a Model Context Protocol (MCP) interface for managing and querying MariaDB databases, supporting standard SQL operations. Designed for use with AI assistants, it enables seamless integration of AI-driven data workflows with relational databases.
 
 ---
 
@@ -9,7 +9,6 @@ The MCP MariaDB Server provides a Model Context Protocol (MCP) interface for man
 - [Overview](#overview)
 - [Core Components](#core-components)
 - [Available Tools](#available-tools)
-- [Embeddings & Vector Store](#embeddings--vector-store)
 - [Configuration & Environment Variables](#configuration--environment-variables)
 - [Installation & Setup](#installation--setup)
 - [Usage Examples](#usage-examples)
@@ -20,12 +19,10 @@ The MCP MariaDB Server provides a Model Context Protocol (MCP) interface for man
 
 ## Overview
 
-The MCP MariaDB Server exposes a set of tools for interacting with MariaDB databases and vector stores via a standardized protocol. It supports:
+The MCP MariaDB Server exposes a set of tools for interacting with MariaDB databases via a standardized protocol. It supports:
 - Listing databases and tables
 - Retrieving table schemas
 - Executing safe, read-only SQL queries
-- Creating and managing vector stores for embedding-based search
-- Integrating with embedding providers (currently OpenAI, Gemini, and HuggingFace) (optional)
 
 ---
 
@@ -33,7 +30,6 @@ The MCP MariaDB Server exposes a set of tools for interacting with MariaDB datab
 
 - **server.py**: Main MCP server logic and tool definitions.
 - **config.py**: Loads configuration from environment and `.env` files.
-- **embeddings.py**: Handles embedding service integration (OpenAI).
 - **tests/**: Manual and automated test documentation and scripts.
 
 ---
@@ -67,63 +63,6 @@ The MCP MariaDB Server exposes a set of tools for interacting with MariaDB datab
   - Creates a new database if it doesn't exist.
   - Parameters: `database_name` (string, required)  
 
-### Vector Store & Embedding Tools (optional)
-
-**Note**: These tools are only available when `EMBEDDING_PROVIDER` is configured. If no embedding provider is set, these tools will be disabled.
-
-- **create_vector_store**
-  - Creates a new vector store (table) for embeddings.
-  - Parameters: `database_name`, `vector_store_name`, `model_name` (optional), `distance_function` (optional, default: cosine)
-
-- **delete_vector_store**
-  - Deletes a vector store (table).
-  - Parameters: `database_name`, `vector_store_name`
-
-- **list_vector_stores**
-  - Lists all vector stores in a database.
-  - Parameters: `database_name`
-
-- **insert_docs_vector_store**
-  - Batch inserts documents (and optional metadata) into a vector store.
-  - Parameters: `database_name`, `vector_store_name`, `documents` (list of strings), `metadata` (optional list of dicts)
-
-- **search_vector_store**
-  - Performs semantic search for similar documents using embeddings.
-  - Parameters: `database_name`, `vector_store_name`, `user_query` (string), `k` (optional, default: 7)
-
----
-
-## Embeddings & Vector Store
-
-### Overview
-
-The MCP MariaDB Server provides **optional** embedding and vector store capabilities. These features can be enabled by configuring an embedding provider, or completely disabled if you only need standard database operations.
-
-### Supported Providers
-
-- **OpenAI**
-- **Gemini**
-- **Open models from Huggingface**
-
-### Configuration
-
-- `EMBEDDING_PROVIDER`: Set to `openai`, `gemini`, `huggingface`, or leave unset to disable
-- `OPENAI_API_KEY`: Required if using OpenAI embeddings
-- `GEMINI_API_KEY`: Required if using Gemini embeddings
-- `HF_MODEL`: Required if using HuggingFace embeddings (e.g., "intfloat/multilingual-e5-large-instruct" or "BAAI/bge-m3")
-### Model Selection
-
-- Default and allowed models are configurable in code (`DEFAULT_OPENAI_MODEL`, `ALLOWED_OPENAI_MODELS`)
-- Model can be selected per request or defaults to the configured model
-
-### Vector Store Schema
-
-A vector store table has the following columns:
-- `id`: Auto-increment primary key
-- `document`: Text of the document
-- `embedding`: VECTOR type (indexed for similarity search)
-- `metadata`: JSON (optional metadata)
-
 ---
 
 ## Configuration & Environment Variables
@@ -139,31 +78,9 @@ All configuration is via environment variables (typically set in a `.env` file):
 | `DB_NAME`              | Default database (optional; can be set per query)      | No       |              |
 | `MCP_READ_ONLY`        | Enforce read-only SQL mode (`true`/`false`)            | No       | `true`       |
 | `MCP_MAX_POOL_SIZE`    | Max DB connection pool size                            | No       | `10`         |
-| `EMBEDDING_PROVIDER`   | Embedding provider (`openai`/`gemini`/`huggingface`)   | No     |`None`(Disabled)|
-| `OPENAI_API_KEY`       | API key for OpenAI embeddings                          | Yes (if EMBEDDING_PROVIDER=openai) | |
-| `GEMINI_API_KEY`       | API key for Gemini embeddings                          | Yes (if EMBEDDING_PROVIDER=gemini) | |
-| `HF_MODEL`             | Open models from Huggingface                           | Yes (if EMBEDDING_PROVIDER=huggingface) | |
 
 #### Example `.env` file
 
-**With Embedding Support (OpenAI):**
-```dotenv
-DB_HOST=localhost
-DB_USER=your_db_user
-DB_PASSWORD=your_db_password
-DB_PORT=3306
-DB_NAME=your_default_database
-
-MCP_READ_ONLY=true
-MCP_MAX_POOL_SIZE=10
-
-EMBEDDING_PROVIDER=openai
-OPENAI_API_KEY=sk-...
-GEMINI_API_KEY=AI...
-HF_MODEL="BAAI/bge-m3"
-```
-
-**Without Embedding Support:**
 ```dotenv
 DB_HOST=localhost
 DB_USER=your_db_user
@@ -233,47 +150,6 @@ MCP_MAX_POOL_SIZE=10
 }
 ```
 
-### Create Vector Store
-
-```python
-{
-  "tool": "create_vector_store",
-  "parameters": {
-    "database_name": "test_db",
-    "vector_store_name": "my_vectors",
-    "model_name": "text-embedding-3-small",
-    "distance_function": "cosine"
-  }
-}
-```
-
-### Insert Documents into Vector Store
-
-```python
-{
-  "tool": "insert_docs_vector_store",
-  "parameters": {
-    "database_name": "test_db",
-    "vector_store_name": "my_vectors",
-    "documents": ["Sample text 1", "Sample text 2"],
-    "metadata": [{"source": "doc1"}, {"source": "doc2"}]
-  }
-}
-```
-
-### Semantic Search
-
-```python
-{
-  "tool": "search_vector_store",
-  "parameters": {
-    "database_name": "test_db",
-    "vector_store_name": "my_vectors",
-    "user_query": "What is the capital of France?",
-    "k": 5
-  }
-}
-```
 ---
 
 ## Integration - Claude desktop/Cursor/Windsurf/VSCode
@@ -290,7 +166,7 @@ MCP_MAX_POOL_SIZE=10
         "run",
         "server.py"
         ],
-        "envFile": "path/to/mcp-server-mariadb-vector/.env"      
+        "envFile": "path/to/mariadb-mcp-server/.env"      
     }
   }
 }
@@ -325,7 +201,7 @@ MCP_MAX_POOL_SIZE=10
 ## Logging
 
 - Logs are written to `logs/mcp_server.log` by default.
-- Log messages include tool calls, configuration issues, embedding errors, and client requests.
+- Log messages include tool calls, configuration issues, and client requests.
 - Log level and output can be adjusted in the code (see `config.py` and logger setup).
 
 ---
@@ -334,4 +210,4 @@ MCP_MAX_POOL_SIZE=10
 
 - Tests are located in the `src/tests/` directory.
 - See `src/tests/README.md` for an overview.
-- Tests cover both standard SQL and vector/embedding tool operations.
+- Tests cover standard SQL tool operations.
