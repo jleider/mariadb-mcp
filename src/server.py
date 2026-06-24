@@ -4,11 +4,14 @@ import logging
 import argparse
 import re
 from typing import List, Dict, Any, Optional
-from functools import partial 
+from functools import partial
 
 import asyncmy
-import anyio 
+import anyio
 from fastmcp import FastMCP, Context
+from fastmcp.server.middleware.logging import LoggingMiddleware
+from starlette.middleware import Middleware as ASGIMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 # Import configuration settings
 from config import (
@@ -18,6 +21,56 @@ from config import (
 )
 
 from asyncmy.errors import Error as AsyncMyError
+_http_logger = logging.getLogger("mariadb_mcp.http")
+_mcp_logger = logging.getLogger("mariadb_mcp.requests")
+
+
+class HTTPRequestLogMiddleware:
+    """Raw ASGI middleware that logs every HTTP request: method, path, headers, and body."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "UNKNOWN")
+        path = scope.get("path", "")
+        query = scope.get("query_string", b"").decode("utf-8", errors="replace")
+        headers = {
+            k.decode("utf-8", errors="replace"): v.decode("utf-8", errors="replace")
+            for k, v in scope.get("headers", [])
+        }
+
+        _http_logger.debug("HTTP %s %s%s", method, path, f"?{query}" if query else "")
+        _http_logger.debug("Request headers: %s", headers)
+
+        body_chunks: list[bytes] = []
+
+        async def receive_with_log() -> dict:
+            message = await receive()
+            if message.get("type") == "http.request":
+                chunk = message.get("body", b"")
+                if chunk:
+                    body_chunks.append(chunk)
+            return message
+
+        async def send_with_log(message: dict) -> None:
+            if message.get("type") == "http.response.start":
+                if body_chunks:
+                    body = b"".join(body_chunks)
+                    try:
+                        body_str = body[:4000].decode("utf-8", errors="replace")
+                    except Exception:
+                        body_str = repr(body[:500])
+                    _http_logger.debug("Request body: %s", body_str)
+                _http_logger.debug("Response status: %s", message.get("status"))
+            await send(message)
+
+        await self.app(scope, receive_with_log, send_with_log)
+
 
 # --- MariaDB MCP Server Class ---
 class MariaDBServer:
@@ -28,11 +81,21 @@ class MariaDBServer:
     def __init__(self, server_name="MariaDB_Server", autocommit=True):
         self.mcp = FastMCP(server_name)
         self.pool: Optional[asyncmy.Pool] = None
-        self.autocommit=autocommit
+        self.autocommit = autocommit
         self.is_read_only = MCP_READ_ONLY
         logger.info(f"Initializing {server_name}...")
         if self.is_read_only:
             logger.warning("Server running in READ-ONLY mode. Write operations are disabled.")
+
+        # Log every MCP protocol message (initialize, tools/list, tools/call, etc.)
+        self.mcp.add_middleware(
+            LoggingMiddleware(
+                logger=_mcp_logger,
+                log_level=logging.DEBUG,
+                include_payloads=True,
+                max_payload_length=4000,
+            )
+        )
 
     async def initialize_pool(self):
         """Initializes the asyncmy connection pool within the running event loop."""
@@ -87,14 +150,14 @@ class MariaDBServer:
             raise RuntimeError("Database connection pool not available.")
 
         allowed_prefixes = ('SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'USE')
-        
+
         # Strip SQL comments from query
         # Remove single-line comments (-- comment)
         sql_no_comments = re.sub(r'--.*?$', '', sql, flags=re.MULTILINE)
         # Remove multi-line comments (/* comment */)
         sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
         sql_no_comments = sql_no_comments.strip()
-        
+
         query_upper = sql_no_comments.upper()
         is_allowed_read_query = any(query_upper.startswith(prefix) for prefix in allowed_prefixes)
 
@@ -128,26 +191,23 @@ class MariaDBServer:
         except AsyncMyError as e:
             conn_state = f"Connection: {'acquired' if conn else 'not acquired'}"
             logger.error(f"Database error executing query ({conn_state}): {e}", exc_info=True)
-            # Check for specific connection-related errors if possible
             raise RuntimeError(f"Database error: {e}") from e
         except PermissionError as e:
              logger.warning(f"Permission denied: {e}")
              raise e
         except Exception as e:
-            # Catch potential loop closed errors here too, although ideally fixed by structure change
             if isinstance(e, RuntimeError) and 'Event loop is closed' in str(e):
                  logger.critical("Detected closed event loop during query execution!", exc_info=True)
-                 # This indicates a fundamental problem with loop management still exists
                  raise RuntimeError("Event loop closed unexpectedly during query.") from e
             conn_state = f"Connection: {'acquired' if conn else 'not acquired'}"
             logger.error(f"Unexpected error during query execution ({conn_state}): {e}", exc_info=True)
             raise RuntimeError(f"An unexpected error occurred: {e}") from e
-            
+
     async def _database_exists(self, database_name: str) -> bool:
         """Checks if a database exists."""
         if not database_name or not database_name.isidentifier():
             logger.warning(f"_database_exists called with invalid database_name: {database_name}")
-            return False 
+            return False
 
         sql = "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s"
         try:
@@ -156,7 +216,7 @@ class MariaDBServer:
         except Exception as e:
             logger.error(f"Error checking if database '{database_name}' exists: {e}", exc_info=True)
             return False
-        
+
     # --- MCP Tool Definitions ---
 
     async def list_databases(self) -> List[str]:
@@ -232,7 +292,7 @@ class MariaDBServer:
         except Exception as e:
             logger.error(f"TOOL ERROR: get_table_schema failed for database_name={database_name}, table_name={table_name}: {e}", exc_info=True)
             raise RuntimeError(f"Could not retrieve schema for table '{database_name}.{table_name}'.")
-        
+
     async def get_table_schema_with_relations(self, database_name: str, table_name: str) -> Dict[str, Any]:
         """
         Retrieves table schema with foreign key relationship information.
@@ -249,10 +309,10 @@ class MariaDBServer:
         try:
             # 1. Get basic schema information
             basic_schema = await self.get_table_schema(database_name, table_name)
-            
+
             # 2. Retrieve foreign key information
             fk_sql = """
-            SELECT 
+            SELECT
                 kcu.COLUMN_NAME as column_name,
                 kcu.CONSTRAINT_NAME as constraint_name,
                 kcu.REFERENCED_TABLE_NAME as referenced_table,
@@ -263,20 +323,20 @@ class MariaDBServer:
             INNER JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
                 ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
                 AND kcu.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
-            WHERE kcu.TABLE_SCHEMA = %s 
-              AND kcu.TABLE_NAME = %s 
+            WHERE kcu.TABLE_SCHEMA = %s
+              AND kcu.TABLE_NAME = %s
               AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
             ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION
             """
-            
+
             fk_results = await self._execute_query(fk_sql, params=(database_name, table_name))
-            
+
             # 3. Add foreign key information to the basic schema
             enhanced_schema = {}
             for col_name, col_info in basic_schema.items():
                 enhanced_schema[col_name] = col_info.copy()
                 enhanced_schema[col_name]['foreign_key'] = None
-            
+
             # 4. Add foreign key information to the corresponding columns
             for fk_row in fk_results:
                 column_name = fk_row['column_name']
@@ -288,16 +348,16 @@ class MariaDBServer:
                         'on_update': fk_row['on_update'],
                         'on_delete': fk_row['on_delete']
                     }
-            
+
             # 5. Return the enhanced schema with foreign key relations
             result = {
                 'table_name': table_name,
                 'columns': enhanced_schema
             }
-            
+
             logger.info(f"TOOL END: get_table_schema_with_relations completed. Columns: {len(enhanced_schema)}, Foreign keys: {len(fk_results)}")
             return result
-            
+
         except Exception as e:
             logger.error(f"TOOL ERROR: get_table_schema_with_relations failed for database_name={database_name}, table_name={table_name}: {e}", exc_info=True)
             raise RuntimeError(f"Could not retrieve schema with relations for table '{database_name}.{table_name}': {str(e)}")
@@ -321,7 +381,7 @@ class MariaDBServer:
         except Exception as e:
             logger.error(f"TOOL ERROR: execute_sql failed for database_name={database_name}, sql_query={sql_query[:100]}, parameters={parameters}: {e}", exc_info=True)
             raise
-            
+
     async def create_database(self, database_name: str) -> Dict[str, Any]:
         """
         Creates a new database if it doesn't exist.
@@ -361,32 +421,32 @@ class MariaDBServer:
         async def list_databases() -> List[str]:
             """Lists all accessible databases on the connected MariaDB server."""
             return await self.list_databases()
-            
+
         @self.mcp.tool
         async def list_tables(database_name: str) -> List[str]:
             """Lists all tables within the specified database."""
             return await self.list_tables(database_name)
-            
+
         @self.mcp.tool
         async def get_table_schema(database_name: str, table_name: str) -> Dict[str, Any]:
             """Retrieves the schema for a specific table in a database."""
             return await self.get_table_schema(database_name, table_name)
-            
+
         @self.mcp.tool
         async def get_table_schema_with_relations(database_name: str, table_name: str) -> Dict[str, Any]:
             """Retrieves table schema with foreign key relationship information."""
             return await self.get_table_schema_with_relations(database_name, table_name)
-            
+
         @self.mcp.tool
         async def execute_sql(sql_query: str, database_name: str, parameters: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
             """Executes a read-only SQL query against a specified database."""
             return await self.execute_sql(sql_query, database_name, parameters)
-            
+
         @self.mcp.tool
         async def create_database(database_name: str) -> Dict[str, Any]:
             """Creates a new database if it doesn't exist."""
             return await self.create_database(database_name)
-            
+
         logger.info("Registered MCP tools explicitly.")
 
     # --- Async Main Server Logic ---
@@ -403,18 +463,30 @@ class MariaDBServer:
             self.register_tools()
 
             # 3. Prepare transport arguments
-            transport_kwargs = {}
+            starlette_middleware = [ASGIMiddleware(HTTPRequestLogMiddleware)]
+            transport_kwargs: Dict[str, Any] = {}
             if transport == "sse":
-                transport_kwargs = {"host": host, "port": port}
+                transport_kwargs = {
+                    "host": host,
+                    "port": port,
+                    "middleware": starlette_middleware,
+                    "uvicorn_config": {"access_log": True},
+                }
                 logger.info(f"Starting MCP server via {transport} on {host}:{port}...")
             elif transport == "http":
-                transport_kwargs = {"host": host, "port": port, "path": path}
+                transport_kwargs = {
+                    "host": host,
+                    "port": port,
+                    "path": path,
+                    "middleware": starlette_middleware,
+                    "uvicorn_config": {"access_log": True},
+                }
                 logger.info(f"Starting MCP server via {transport} on {host}:{port}{path}...")
             elif transport == "stdio":
                  logger.info(f"Starting MCP server via {transport}...")
             else:
                  logger.error(f"Unsupported transport type: {transport}")
-                 return 
+                 return
 
             # 4. Run the appropriate async listener from FastMCP
             await self.mcp.run_async(transport=transport, **transport_kwargs)
@@ -449,10 +521,10 @@ if __name__ == "__main__":
     try:
         # 2. Use anyio.run to manage the event loop and call the main async server logic
         anyio.run(
-            partial(server.run_async_server, 
-                    transport=args.transport, 
-                    host=args.host, 
-                    port=args.port, 
+            partial(server.run_async_server,
+                    transport=args.transport,
+                    host=args.host,
+                    port=args.port,
                     path=args.path)
         )
         logger.info("Server finished gracefully.")
