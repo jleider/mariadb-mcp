@@ -38,14 +38,14 @@ def setup_mcp():
     return server
 
 class TestMariaDBMCPTools(unittest.IsolatedAsyncioTestCase):
-    async def setUp(self):
+    async def asyncSetUp(self):
         server = MariaDBServer()
         self.server = server
         await server.initialize_pool()
         server.register_tools()
 
-    def tearDown(self):
-        self.server.close_pool()
+    async def asyncTearDown(self):
+        await self.server.close_pool()
 
     async def test_step_1_list_databases(self):
         """

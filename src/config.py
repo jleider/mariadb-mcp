@@ -14,6 +14,18 @@ LOG_FILE_PATH = os.getenv("LOG_FILE", "logs/mcp_server.log")
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", 10 * 1024 * 1024))
 LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", 5))
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS")
+if ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = ALLOWED_ORIGINS.split(",")
+else:
+    ALLOWED_ORIGINS = ["http://localhost", "http://127.0.0.1", "http://*", "https://localhost", "https://127.0.0.1", "vscode-file://vscode-app"]
+
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS")
+if ALLOWED_HOSTS:
+    ALLOWED_HOSTS = ALLOWED_HOSTS.split(",")
+else:
+    ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
+
 # Get the root logger
 root_logger = logging.getLogger()
 root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
@@ -51,6 +63,15 @@ DB_PORT = int(os.getenv("DB_PORT", 3306))
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME = os.getenv("DB_NAME")
+DB_CHARSET = os.getenv("DB_CHARSET")
+
+# --- SSL Configuration ---
+DB_SSL = os.getenv("DB_SSL", "false").lower() == "true"
+DB_SSL_CA = os.getenv("DB_SSL_CA")
+DB_SSL_CERT = os.getenv("DB_SSL_CERT")
+DB_SSL_KEY = os.getenv("DB_SSL_KEY")
+DB_SSL_VERIFY_CERT = os.getenv("DB_SSL_VERIFY_CERT", "true").lower() == "true"
+DB_SSL_VERIFY_IDENTITY = os.getenv("DB_SSL_VERIFY_IDENTITY", "false").lower() == "true"
 
 # --- MCP Server Configuration ---
 # Read-only mode
@@ -59,8 +80,10 @@ MCP_MAX_POOL_SIZE = int(os.getenv("MCP_MAX_POOL_SIZE", 10))
 
 
 # --- Validation ---
-if not all([DB_USER, DB_PASSWORD]):
-    logger.error("Database credentials (DB_USER, DB_PASSWORD) not found in environment variables or .env file.")
+if not DB_USER:
+    logger.error("DB_USER is empty or missing from the environment or .env file.")
+if DB_PASSWORD is None:
+    logger.error("DB_PASSWORD is missing from the environment or .env file.")
 
 logger.info(f"Read-only mode: {MCP_READ_ONLY}")
 logger.info(f"Logging to console and to file: {LOG_FILE_PATH} (Level: {LOG_LEVEL}, MaxSize: {LOG_MAX_BYTES}B, Backups: {LOG_BACKUP_COUNT})")

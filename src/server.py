@@ -1,21 +1,32 @@
 # server.py
+
+# Import configuration settings
+from config import (
+    DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME, DB_CHARSET,
+    DB_SSL, DB_SSL_CA, DB_SSL_CERT, DB_SSL_KEY, DB_SSL_VERIFY_CERT, DB_SSL_VERIFY_IDENTITY,
+    MCP_READ_ONLY, MCP_MAX_POOL_SIZE,
+    ALLOWED_ORIGINS, ALLOWED_HOSTS,
+    logger
+)
+
 import asyncio
-import logging
 import argparse
 import re
 from typing import List, Dict, Any, Optional
-from functools import partial 
+from functools import partial
+import os
+import ssl
 
 import asyncmy
 import anyio 
 from fastmcp import FastMCP, Context
 
-# Import configuration settings
-from config import (
-    DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME,
-    MCP_READ_ONLY, MCP_MAX_POOL_SIZE,
-    logger
-)
+# Import custom connection pool that disables MULTI_STATEMENTS
+from custom_connection import create_safe_pool
+
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from asyncmy.errors import Error as AsyncMyError
 
@@ -28,36 +39,130 @@ class MariaDBServer:
     def __init__(self, server_name="MariaDB_Server", autocommit=True):
         self.mcp = FastMCP(server_name)
         self.pool: Optional[asyncmy.Pool] = None
-        self.autocommit=autocommit
+        self.autocommit = not MCP_READ_ONLY
         self.is_read_only = MCP_READ_ONLY
         logger.info(f"Initializing {server_name}...")
         if self.is_read_only:
             logger.warning("Server running in READ-ONLY mode. Write operations are disabled.")
 
+    async def _warn_if_file_privilege_enabled(self) -> None:
+        if self.pool is None:
+            return
+
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute("SELECT CURRENT_USER()")
+                    current_user_row = await cursor.fetchone()
+                    if not current_user_row:
+                        return
+
+                    if isinstance(current_user_row, dict):
+                        current_user = next(iter(current_user_row.values()))
+                    else:
+                        current_user = current_user_row[0]
+
+                    if not current_user:
+                        return
+
+                    await cursor.execute(f"SHOW GRANTS FOR {current_user}")
+                    grant_rows = await cursor.fetchall()
+
+                    grants: List[str] = []
+                    for row in grant_rows or []:
+                        if isinstance(row, dict):
+                            grants.append(str(next(iter(row.values()))))
+                        else:
+                            grants.append(str(row[0]))
+
+                    has_file_priv = any(
+                        re.search(r"\bFILE\b", grant, flags=re.IGNORECASE) and "ON *.*" in grant.upper()
+                        for grant in grants
+                    )
+
+                    if has_file_priv:
+                        logger.error(
+                            "Connected database user has the global FILE privilege. "
+                            "This means the server is NOT running in a fully read-only posture, because MariaDB/MySQL allow "
+                            "filesystem read/write via SQL (e.g. SELECT ... INTO OUTFILE, LOAD DATA INFILE, LOAD_FILE()). "
+                            "This cannot be fixed client-side; revoke FILE for the database user you are connecting as."
+                        )
+        except Exception as e:
+            logger.debug(f"Unable to determine whether FILE privilege is enabled: {e}")
+
     async def initialize_pool(self):
         """Initializes the asyncmy connection pool within the running event loop."""
-        if not all([DB_USER, DB_PASSWORD]):
-             logger.error("Cannot initialize pool due to missing database credentials.")
-             raise ConnectionError("Missing database credentials for pool initialization.")
+        if not DB_USER:
+            logger.error("Cannot initialize pool: DB_USER is empty or missing")
+            raise ConnectionError("Missing DB_USER for pool initialization.")
+        if DB_PASSWORD is None:
+            logger.error("Cannot initialize pool: DB_PASSWORD is missing")
+            raise ConnectionError("Missing DB_PASSWORD for pool initialization.")
 
         if self.pool is not None:
             logger.info("Connection pool already initialized.")
             return
 
         try:
-            logger.info(f"Creating connection pool for {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME} (max size: {MCP_MAX_POOL_SIZE})")
-            self.pool = await asyncmy.create_pool(
-                host=DB_HOST,
-                port=DB_PORT,
-                user=DB_USER,
-                password=DB_PASSWORD,
-                db=DB_NAME,
-                minsize=1,
-                maxsize=MCP_MAX_POOL_SIZE,
-                autocommit=self.autocommit,
-                pool_recycle=3600
-            )
+            ssl_context = None
+            if DB_SSL:
+                ssl_context = ssl.create_default_context()
+                if DB_SSL_CA:
+                    ca_path = os.path.expanduser(DB_SSL_CA)
+                    if os.path.exists(ca_path):
+                        ssl_context.load_verify_locations(cafile=ca_path)
+                        logger.info(f"Loaded SSL CA certificate: {ca_path}")
+                    else:
+                        logger.warning(f"SSL CA certificate file not found: {ca_path}")
+
+                if DB_SSL_CERT and DB_SSL_KEY:
+                    cert_path = os.path.expanduser(DB_SSL_CERT)
+                    key_path = os.path.expanduser(DB_SSL_KEY)
+                    if os.path.exists(cert_path) and os.path.exists(key_path):
+                        ssl_context.load_cert_chain(cert_path, key_path)
+                        logger.info(f"Loaded SSL client certificate: {cert_path}")
+                    else:
+                        logger.warning(f"SSL client certificate files not found: cert={cert_path}, key={key_path}")
+
+                if not DB_SSL_VERIFY_CERT:
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                    logger.info("SSL certificate verification disabled")
+                elif not DB_SSL_VERIFY_IDENTITY:
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_REQUIRED
+                    logger.info("SSL hostname verification disabled, certificate verification enabled")
+                else:
+                    logger.info("Full SSL verification enabled")
+
+                logger.info("SSL enabled for database connection")
+            else:
+                logger.info("SSL disabled for database connection")
+
+            pool_params = {
+                "host": DB_HOST,
+                "port": DB_PORT,
+                "user": DB_USER,
+                "password": DB_PASSWORD,
+                "db": DB_NAME,
+                "minsize": 1,
+                "maxsize": MCP_MAX_POOL_SIZE,
+                "autocommit": self.autocommit,
+                "pool_recycle": 3600
+            }
+            if DB_SSL and ssl_context is not None:
+                pool_params["ssl"] = ssl_context
+
+            if DB_CHARSET:
+                pool_params["charset"] = DB_CHARSET
+                logger.info(f"Creating connection pool for {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME} (max size: {MCP_MAX_POOL_SIZE}, charset: {DB_CHARSET})")
+            else:
+                logger.info(f"Creating connection pool for {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME} (max size: {MCP_MAX_POOL_SIZE})")
+            
+            self.pool = await create_safe_pool(**pool_params)
             logger.info("Connection pool initialized successfully.")
+            if self.is_read_only:
+                await self._warn_if_file_privilege_enabled()
         except AsyncMyError as e:
             logger.error(f"Failed to initialize database connection pool: {e}", exc_info=True)
             self.pool = None
@@ -101,6 +206,22 @@ class MariaDBServer:
         if self.is_read_only and not is_allowed_read_query:
              logger.warning(f"Blocked potentially non-read-only query in read-only mode: {sql[:100]}...")
              raise PermissionError("Operation forbidden: Server is in read-only mode.")
+        if self.is_read_only:
+            # Remove string literals to avoid matching patterns inside strings
+            # Handle both single and double quoted strings
+            sql_no_strings = re.sub(r"'(?:[^'\\]|\\.)*'", "''", sql_no_comments)
+            sql_no_strings = re.sub(r'"(?:[^"\\]|\\.)*"', '""', sql_no_strings)
+            sql_no_strings_upper = sql_no_strings.upper()
+            
+            # Check for LOAD_FILE() function (case-insensitive, outside strings)
+            if re.search(r'\bLOAD_FILE\s*\(', sql_no_strings_upper):
+                logger.warning(f"Blocked query containing LOAD_FILE(): {sql[:100]}...")
+                raise PermissionError("Operation forbidden: LOAD_FILE() is not allowed for security reasons.")
+            
+            # Check for SELECT ... INTO OUTFILE/DUMPFILE (case-insensitive, outside strings)
+            if re.search(r'\bINTO\s+(OUTFILE|DUMPFILE)\b', sql_no_strings_upper):
+                logger.warning(f"Blocked query containing SELECT INTO OUTFILE or DUMPFILE: {sql[:100]}...")
+                raise PermissionError("Operation forbidden: SELECT INTO OUTFILE and SELECT INTO DUMPFILE are not allowed for security reasons.")
 
         logger.info(f"Executing query (DB: {database or DB_NAME}): {sql[:100]}...")
         if params:
@@ -121,7 +242,10 @@ class MariaDBServer:
                         logger.info(f"Switching database context from '{actual_current_db}' to '{database}'")
                         await cursor.execute(f"USE `{database}`")
 
-                    await cursor.execute(sql, params or ())
+                    if params is None:
+                        await cursor.execute(sql)
+                    else:
+                        await cursor.execute(sql, params)
                     results = await cursor.fetchall()
                     logger.info(f"Query executed successfully, {len(results)} rows returned.")
                     return results if results else []
@@ -305,7 +429,7 @@ class MariaDBServer:
 
     async def execute_sql(self, sql_query: str, database_name: str, parameters: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
         """
-        Executes a read-only SQL query (primarily SELECT, SHOW, DESCRIBE) against a specified database
+        Executes a SQL query (primarily SELECT, SHOW, DESCRIBE) against a specified database
         and returns the results. Uses parameterized queries for safety.
         Example `parameters`: ["value1", 123] corresponding to %s placeholders in `sql_query`.
         """
@@ -404,11 +528,22 @@ class MariaDBServer:
 
             # 3. Prepare transport arguments
             transport_kwargs = {}
+            if transport != "stdio":
+                middleware = [
+                    Middleware(
+                        CORSMiddleware,
+                        allow_origins=ALLOWED_ORIGINS,
+                        allow_methods=["GET", "POST"],
+                        allow_headers=["*"],
+                    ),
+                    Middleware(TrustedHostMiddleware, 
+                               allowed_hosts=ALLOWED_HOSTS)
+                ]
             if transport == "sse":
-                transport_kwargs = {"host": host, "port": port}
+                transport_kwargs = {"host": host, "port": port, "middleware": middleware}
                 logger.info(f"Starting MCP server via {transport} on {host}:{port}...")
             elif transport == "http":
-                transport_kwargs = {"host": host, "port": port, "path": path}
+                transport_kwargs = {"host": host, "port": port, "path": path, "middleware": middleware}
                 logger.info(f"Starting MCP server via {transport} on {host}:{port}{path}...")
             elif transport == "stdio":
                  logger.info(f"Starting MCP server via {transport}...")
