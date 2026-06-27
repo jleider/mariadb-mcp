@@ -191,7 +191,12 @@ class MariaDBServer:
             logger.error("Connection pool is not initialized.")
             raise RuntimeError("Database connection pool not available.")
 
-        allowed_prefixes = ('SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'USE')
+        # EXPLAIN is read-only: plain `EXPLAIN <stmt>` only returns a plan and never
+        # executes the statement (MariaDB's executing variant starts with ANALYZE, which
+        # is not allowlisted). This enables `EXPLAIN [ANALYZE] SELECT ...` for profiling.
+        # Note: WITH is intentionally excluded — a data-modifying CTE (e.g.
+        # `WITH x AS (...) DELETE FROM ...`) would otherwise bypass read-only enforcement.
+        allowed_prefixes = ('SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'USE', 'EXPLAIN')
         
         # Strip SQL comments from query
         # Remove single-line comments (-- comment)
