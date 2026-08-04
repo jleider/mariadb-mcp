@@ -1,0 +1,33 @@
+# Disposable MariaDB used by the integration tests.
+#
+# Runs on host port 3307 so it never collides with a local MariaDB on 3306.
+# Storage is tmpfs, so the container starts empty every time and the fixture
+# scripts in src/tests/fixtures/ are re-applied on each `up`.
+#
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   python -m unittest discover -s src/tests -t .
+#   docker compose -f docker-compose.test.yml down
+services:
+  mariadb-test:
+    image: mariadb:11
+    container_name: mariadb-mcp-test
+    environment:
+      MARIADB_ROOT_PASSWORD: testrootpw
+      MARIADB_DATABASE: mcp_test
+      MARIADB_USER: mcp_test
+      MARIADB_PASSWORD: mcp_test_pw
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./src/tests/fixtures:/docker-entrypoint-initdb.d:ro
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      # Checks that the fixture schema finished loading, not just that the
+      # server is up, so `--wait` does not return before the tests can run.
+      test: ["CMD", "mariadb", "-umcp_test", "-pmcp_test_pw", "-Dmcp_test",
+             "-e", "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='mcp_test' AND TABLE_NAME='documented'"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s

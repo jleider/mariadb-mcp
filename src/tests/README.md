@@ -1,38 +1,68 @@
-# MariaDB Ops Server MCP Tool Tests
+# MariaDB MCP Server Tests
 
-This directory contains artifacts related to testing the MariaDB Ops Server MCP (Model Context Protocol) tools.
+## Running the tests
 
-## Purpose
+From the repository root:
 
-The primary goal of these tests was to verify the basic functionality and robustness of the read-only operations provided by the MariaDB MCP server tools:
+```bash
+# Unit tests only (no database needed) — integration tests skip automatically
+python -m unittest discover -s src/tests -t .
 
--   `mcp0_list_databases`
--   `mcp0_list_tables`
--   `mcp0_get_table_schema`
--   `mcp0_execute_sql`
+# Everything, including integration tests
+docker compose -f docker-compose.test.yml up -d --wait
+python -m unittest discover -s src/tests -t .
+docker compose -f docker-compose.test.yml down
+```
 
-## Execution Method
+Run the suite from the repository root, not from `src/`. `src/tests/__init__.py`
+puts `src/` on `sys.path` so that `server.py`'s flat imports (`from config
+import ...`) resolve while the tests import `src.server`.
 
-Tests were performed **manually** via the AI Assistant interface. The interface invoked the MCP tools directly based on user requests, and the results (or errors) were observed in the assistant's responses.
+## Layout
 
-From there, tests were converted into code in test_mariadb_mcp_tools.py`. We use the python `unittest` framework to structure the tests. Note that the environment variables are still used in the unit tests, and a live mariadb server is required to run the tests currently.
+| File | Needs a database | What it covers |
+| --- | --- | --- |
+| `test_table_schema_comments.py` | No (mocked) | Schema-tool logic in isolation: comment handling, validation, error paths, field mapping |
+| `test_list_databases_unittest.py` | No (mocked) | `list_databases` |
+| `test_integration_schema_comments.py` | Yes | Table/column comments against a real schema (DL-5840) |
+| `test_mcp_server.py` | Yes | All six tools through a fastmcp client, plus read-only enforcement |
+| `test_mariadb_mcp_tools.py` | Yes | Tool behaviour called directly: SQL execution, joins, aggregation, parameter edge cases |
+| `smoke_test.py` | Yes | Standalone sanity check; run directly, not collected by `unittest` |
+| `support.py` | — | Shared integration fixtures and the skip-if-unavailable probe |
+| `fixtures/01-test-schema.sql` | — | Schema loaded into the test container |
 
-## Test Cases
+## The test database
 
-The specific test cases executed are documented in the `test_mariadb_mcp_tools.py` script within this directory. This script serves as a record of the manual tests performed and includes:
+`docker-compose.test.yml` runs MariaDB 11 on host port **3307**, so it never
+collides with a local server on 3306. Storage is `tmpfs`, so every `up` starts
+from an empty data directory and re-applies `fixtures/01-test-schema.sql`. The
+healthcheck waits for the fixture tables, so `--wait` does not return early.
 
-1.  **Basic Functionality Tests:** Verifying core operations like listing databases/tables, getting schema, and executing simple SELECTs.
-2.  **Complex/Edge Case Tests:** Checking behavior with:
-    *   Non-existent databases/tables
-    *   Complex SQL (JOINs, Aggregations)
-    *   Parameterized queries with edge-case values (empty strings)
-    *   Parameter count mismatches
-    *   `SHOW` commands (including necessary wildcard escaping)
+Connection details default to that container and can be overridden with
+`TEST_DB_HOST`, `TEST_DB_PORT`, `TEST_DB_USER`, `TEST_DB_PASSWORD`,
+`TEST_DB_NAME` and `TEST_DB_OTHER_NAME`. Note that the integration tests do
+**not** read `.env`; they patch the settings that `server.py` binds at import
+time, so they never touch a real database by accident.
 
-## Summary of Results
+When the container is not reachable, integration tests skip with a message
+telling you how to start it, rather than failing.
 
-All tests executed as expected. The tools successfully performed the requested read-only operations and provided appropriate error messages for invalid inputs or non-existent objects. The `mcp0_execute_sql` tool required correct escaping (`%%`) for literal `%` signs in `LIKE` clauses when used with `SHOW` commands.
+## What the fixture schema is for
 
-## `test_mariadb_mcp_tools.py`
+Each object exists to pin down a specific behaviour:
 
-This Python script outlines the tests performed. It is **not** an automated test suite but rather a structured documentation of the manual steps and observed outcomes. It cannot be run independently to interact with the MCP tools.
+-   `documented` — every column commented, plus one deliberately uncommented column, a `DEFAULT`, and a foreign key
+-   `undocumented` — no comments anywhere; everything must come back as `''`
+-   `column_defaults` — every shape of column default, because `INFORMATION_SCHEMA.COLUMN_DEFAULT` returns SQL literals (`'active'`) and the string `NULL` for "no default", all of which get decoded back to plain values
+-   `with_comment_column` — has a column literally named `comment`, which is why `get_table_schema` nests columns under `columns` instead of returning them flat
+-   `documented_view` — MariaDB reports `TABLE_COMMENT` as the literal string `'VIEW'` for views, which must be suppressed rather than surfaced as documentation
+-   `parents` — foreign-key target, and a table with no FKs of its own
+-   `mcp_test_other.documented` — same table and column names as `mcp_test.documented` but different comments, so a lookup that forgot `TABLE_SCHEMA` returns visibly wrong text
+
+## Known behaviour pinned by tests
+
+`execute_sql` passes `params or ()` to the driver. An empty tuple is not
+`None`, so the driver applies `%`-formatting even when no parameters were
+supplied, and a literal `%` must be doubled: `SHOW VARIABLES LIKE 'version%%'`
+works, `'version%'` raises. `test_step_12*` pins both halves of this. Changing
+it would silently alter what `%%` means for callers already escaping it.

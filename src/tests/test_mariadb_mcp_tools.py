@@ -1,194 +1,177 @@
-# -*- coding: utf-8 -*-
+"""
+Integration tests for the MariaDB MCP tools, calling the server methods
+directly against a real MariaDB — no mocks.
+
+Start the database first:
+    docker compose -f docker-compose.test.yml up -d --wait
+
+These skip when the container is unreachable. See src/tests/support.py.
+
+History: this file previously documented a manual test plan executed by hand
+through an AI assistant, with the note "cannot be executed directly". Each of
+those twelve steps is now a real assertion against the fixture schema. The old
+class also defined `async def setUp`, which IsolatedAsyncioTestCase never
+awaits, so `self.server` was never assigned and every run errored in tearDown.
+"""
 import unittest
-from unittest.mock import AsyncMock, patch
-import asyncio
 
-import sys
-import os
+from src.tests.support import MariaDBIntegrationTestCase, TEST_DB_NAME
 
-# Import the MariaDBServer from the project
-from server import MariaDBServer
 
-"""
-Manual Test Cases for MariaDB Ops Server MCP Tools via Cascade AI Assistant
+class TestMariaDBMCPTools(MariaDBIntegrationTestCase):
 
-This script outlines the manual tests performed using Cascade AI Assistant
-to verify the functionality of the MariaDB_Ops_Server MCP tools.
-
-These tests were executed interactively and results were observed directly
-from the tool responses within the Cascade environment.
-
-MCP Tools Tested:
-- mcp0_list_databases
-- mcp0_list_tables
-- mcp0_get_table_schema
-- mcp0_execute_sql
-
-NOTE: This script is documentation of manual tests. It cannot be executed
-directly to run the tests as it relies on Cascade's MCP tool interaction.
-"""
-
-# --- Test Plan ---
-# The following functions represent the test steps performed manually.
-# Expected outcomes are based on the interactive session results.
-
-def setup_mcp():
-    server = MariaDBServer()
-    asyncio.run(server.initialize_pool())
-    return server
-
-class TestMariaDBMCPTools(unittest.IsolatedAsyncioTestCase):
-    async def setUp(self):
-        server = MariaDBServer()
-        self.server = server
-        await server.initialize_pool()
-        server.register_tools()
-
-    def tearDown(self):
-        self.server.close_pool()
+    # --- Step 1-5: basic tool behaviour ---
 
     async def test_step_1_list_databases(self):
-        """
-        Test: Call mcp0_list_databases.
-        Purpose: Verify it returns a list of database names.
-        Expected Outcome: Success, returns a JSON list of strings (database names).
-        """
+        """Returns a list of database-name strings, including the system schemas."""
         result = await self.server.list_databases()
+
         self.assertIsInstance(result, list)
         self.assertTrue(all(isinstance(db, str) for db in result))
-        for sys_db in ["mysql", "sys"]:
-            self.assertIn(sys_db, result)
+        for expected in ('information_schema', 'mysql', 'sys', TEST_DB_NAME):
+            self.assertIn(expected, result)
 
-# If this file is run directly, run the tests
+    async def test_step_2_list_tables_valid_db(self):
+        """Lists tables for a known database."""
+        result = await self.server.list_tables('information_schema')
+
+        self.assertIsInstance(result, list)
+        self.assertTrue(all(isinstance(table, str) for table in result))
+        self.assertIn('ALL_PLUGINS', result)
+        self.assertIn('APPLICABLE_ROLES', result)
+
+    async def test_step_3_get_schema_valid_table(self):
+        """Retrieves the schema for a known table."""
+        result = await self.server.get_table_schema('information_schema', 'TABLES')
+
+        self.assertEqual(result['table_name'], 'TABLES')
+        self.assertIn('TABLE_NAME', result['columns'])
+        self.assertIn('TABLE_COMMENT', result['columns'])
+        for column in result['columns'].values():
+            self.assertIn('type', column)
+            self.assertIn('comment', column)
+
+    async def test_step_4_execute_simple_select(self):
+        """Basic SQL execution."""
+        rows = await self.server.execute_sql(
+            'SELECT id, email, status FROM documented ORDER BY id', TEST_DB_NAME)
+
+        self.assertIsInstance(rows, list)
+        # The fixture inserts no rows; the point is that the query succeeds.
+        self.assertEqual(rows, [])
+
+    async def test_step_5_execute_parameterized_select(self):
+        """Parameterized query execution."""
+        rows = await self.server.execute_sql(
+            'SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = %s',
+            TEST_DB_NAME,
+            [TEST_DB_NAME],
+        )
+
+        names = {row['TABLE_NAME'] for row in rows}
+        self.assertIn('documented', names)
+        self.assertIn('parents', names)
+
+    # --- Step 6-7: error handling ---
+
+    async def test_step_6_list_tables_nonexistent_db(self):
+        """Unknown database surfaces an error."""
+        with self.assertRaises(Exception):
+            await self.server.list_tables('db_that_does_not_exist')
+
+    async def test_step_7_get_schema_nonexistent_table(self):
+        """Unknown table surfaces an error."""
+        with self.assertRaises(Exception):
+            await self.server.get_table_schema(TEST_DB_NAME, 'table_that_does_not_exist')
+
+    # --- Step 8-9: more complex SQL ---
+
+    async def test_step_8_execute_complex_join(self):
+        """A JOIN across information_schema tables."""
+        rows = await self.server.execute_sql(
+            'SELECT t.TABLE_NAME, COUNT(c.COLUMN_NAME) AS column_count '
+            'FROM information_schema.TABLES t '
+            'JOIN information_schema.COLUMNS c '
+            '  ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME '
+            'WHERE t.TABLE_SCHEMA = %s '
+            'GROUP BY t.TABLE_NAME ORDER BY t.TABLE_NAME',
+            TEST_DB_NAME,
+            [TEST_DB_NAME],
+        )
+
+        counts = {row['TABLE_NAME']: row['column_count'] for row in rows}
+        self.assertEqual(counts['documented'], 6)
+        self.assertEqual(counts['undocumented'], 2)
+
+    async def test_step_9_execute_aggregation(self):
+        """COUNT/GROUP BY aggregation."""
+        rows = await self.server.execute_sql(
+            'SELECT TABLE_SCHEMA, COUNT(*) AS n FROM information_schema.tables '
+            'WHERE TABLE_SCHEMA = %s GROUP BY TABLE_SCHEMA',
+            TEST_DB_NAME,
+            [TEST_DB_NAME],
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['TABLE_SCHEMA'], TEST_DB_NAME)
+        # Cross-check against list_tables rather than hardcoding a count, so
+        # adding a fixture table does not break this test.
+        expected = len(await self.server.list_tables(TEST_DB_NAME))
+        self.assertEqual(rows[0]['n'], expected)
+
+    # --- Step 10-12: parameter and escaping edge cases ---
+
+    async def test_step_10_execute_param_empty_string(self):
+        """An empty-string parameter binds fine and matches nothing."""
+        rows = await self.server.execute_sql(
+            'SELECT COUNT(*) AS n FROM information_schema.tables WHERE TABLE_SCHEMA = %s',
+            TEST_DB_NAME,
+            [''],
+        )
+
+        self.assertEqual(rows[0]['n'], 0)
+
+    async def test_step_11_execute_param_mismatch(self):
+        """Too few parameters for the placeholders is an error."""
+        with self.assertRaises(Exception):
+            await self.server.execute_sql(
+                'SELECT * FROM information_schema.tables '
+                'WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s',
+                TEST_DB_NAME,
+                ['information_schema'],
+            )
+
+    async def test_step_11b_execute_empty_parameter_list(self):
+        """An empty list is not the same as no parameters; %s stays unbound."""
+        with self.assertRaises(Exception):
+            await self.server.execute_sql(
+                'SELECT * FROM information_schema.tables WHERE TABLE_SCHEMA = %s',
+                TEST_DB_NAME,
+                [],
+            )
+
+    async def test_step_12_execute_show_command(self):
+        """
+        SHOW works, but a literal '%' must be doubled.
+
+        `_execute_query` passes `params or ()` to the driver, and an empty tuple
+        is not None, so the driver still applies %-formatting even when the
+        caller supplied no parameters. Pinning this behaviour deliberately: the
+        alternative (passing None) would silently change what '%%' means for
+        callers already escaping it.
+        """
+        rows = await self.server.execute_sql(
+            "SHOW VARIABLES LIKE 'version%%'", TEST_DB_NAME)
+
+        variables = {row['Variable_name'] for row in rows}
+        self.assertIn('version', variables)
+
+    async def test_step_12b_single_percent_without_params_fails(self):
+        """Documents the escaping requirement above."""
+        with self.assertRaises(Exception):
+            await self.server.execute_sql(
+                "SHOW VARIABLES LIKE 'version%'", TEST_DB_NAME)
+
+
 if __name__ == "__main__":
-    unittest.main()
-
-def test_step_2_list_tables_valid_db():
-    """
-    Test: Call mcp0_list_tables with a valid database ('information_schema').
-    Purpose: Verify it lists tables for a known database.
-    Expected Outcome: Success, returns a JSON list of strings (table names).
-    Result: PASSED (Observed list: ['ALL_PLUGINS', 'APPLICABLE_ROLES', ...])
-    """
-    print("Executing: mcp0_list_tables(database_name='information_schema')")
-    # Manual execution via Cascade passed.
-
-def test_step_3_get_schema_valid_table():
-    """
-    Test: Call mcp0_get_table_schema for 'information_schema.TABLES'.
-    Purpose: Verify it retrieves the schema for a known table.
-    Expected Outcome: Success, returns a JSON object describing columns and types.
-    Result: PASSED (Observed schema details for TABLES columns)
-    """
-    print("Executing: mcp0_get_table_schema(database_name='information_schema', table_name='TABLES')")
-    # Manual execution via Cascade passed.
-
-def test_step_4_execute_simple_select():
-    """
-    Test: Call mcp0_execute_sql with a simple SELECT query.
-    Purpose: Verify basic SQL execution.
-    Expected Outcome: Success, returns JSON list of query results.
-    Result: PASSED (Observed result for SELECT * FROM information_schema.TABLES LIMIT 1)
-    """
-    print("Executing: mcp0_execute_sql(sql_query='SELECT * FROM information_schema.TABLES LIMIT 1')")
-    # Manual execution via Cascade passed.
-
-def test_step_5_execute_parameterized_select():
-    """
-    Test: Call mcp0_execute_sql with a parameterized SELECT query.
-    Purpose: Verify parameterized query execution.
-    Expected Outcome: Success, returns JSON list of filtered query results.
-    Result: PASSED (Observed result for SELECT ... WHERE TABLE_SCHEMA = %s)
-    """
-    print("Executing: mcp0_execute_sql(sql_query='SELECT ... WHERE TABLE_SCHEMA = %s', parameters=['information_schema'])")
-    # Manual execution via Cascade passed.
-
-# --- Complex / Edge Case Tests ---
-
-def test_step_6_list_tables_nonexistent_db():
-    """
-    Test: Call mcp0_list_tables with a non-existent database name.
-    Purpose: Verify error handling for unknown databases.
-    Expected Outcome: Failure/Error response indicating unknown database.
-    Result: PASSED (Observed error: (1049, "Unknown database ..."))
-    """
-    print("Executing: mcp0_list_tables(database_name='db_that_does_not_exist_cascade_test')")
-    # Manual execution via Cascade passed (tool reported error).
-
-def test_step_7_get_schema_nonexistent_table():
-    """
-    Test: Call mcp0_get_table_schema for a non-existent table.
-    Purpose: Verify error handling for unknown tables.
-    Expected Outcome: Failure/Error response indicating schema retrieval failure.
-    Result: PASSED (Observed error: "Could not retrieve schema for table ...")
-    """
-    print("Executing: mcp0_get_table_schema(database_name='information_schema', table_name='table_that_does_not_exist')")
-    # Manual execution via Cascade passed (tool reported error).
-
-def test_step_8_execute_complex_join():
-    """
-    Test: Call mcp0_execute_sql with a JOIN query.
-    Purpose: Verify handling of more complex SQL statements.
-    Expected Outcome: Success, returns JSON list of joined results.
-    Result: PASSED (Observed results from TABLES JOIN COLUMNS query)
-    """
-    print("Executing: mcp0_execute_sql(sql_query='SELECT ... JOIN ...')")
-    # Manual execution via Cascade passed.
-
-def test_step_9_execute_aggregation():
-    """
-    Test: Call mcp0_execute_sql with an aggregation query (COUNT/GROUP BY).
-    Purpose: Verify handling of SQL aggregate functions.
-    Expected Outcome: Success, returns JSON list of aggregated results.
-    Result: PASSED (Observed results for COUNT(*) GROUP BY TABLE_SCHEMA query)
-    """
-    print("Executing: mcp0_execute_sql(sql_query='SELECT COUNT(*) ... GROUP BY ...')")
-    # Manual execution via Cascade passed.
-
-def test_step_10_execute_param_empty_string():
-    """
-    Test: Call mcp0_execute_sql with an empty string parameter.
-    Purpose: Verify handling of specific parameter values.
-    Expected Outcome: Success, returns empty result set (or as appropriate).
-    Result: PASSED (Observed empty result set for WHERE TABLE_SCHEMA = '')
-    """
-    print("Executing: mcp0_execute_sql(sql_query='SELECT ... WHERE col = %s', parameters=[''])")
-    # Manual execution via Cascade passed.
-
-def test_step_11_execute_param_mismatch():
-    """
-    Test: Call mcp0_execute_sql with incorrect number of parameters.
-    Purpose: Verify error handling for parameter mismatch.
-    Expected Outcome: Failure/Error response indicating parameter mismatch.
-    Result: PASSED (Observed error: "not enough arguments for format string")
-    """
-    print("Executing: mcp0_execute_sql(sql_query='SELECT ... WHERE col1 = %s AND col2 = %s', parameters=['one_param'])")
-    # Manual execution via Cascade passed (tool reported error).
-
-def test_step_12_execute_show_command():
-    """
-    Test: Call mcp0_execute_sql with a SHOW command (requires escaping '%').
-    Purpose: Verify handling of non-SELECT read commands and literal '%'.
-    Expected Outcome: Success, returns JSON list of results from SHOW VARIABLES.
-    Result: PASSED (Observed results for SHOW VARIABLES LIKE 'version%%')
-    """
-    print("Executing: mcp0_execute_sql(sql_query='SHOW VARIABLES LIKE \'version%%\'')")
-    # Manual execution via Cascade passed.
-
-
-if __name__ == "__main__":
-    print("Running manual test descriptions...")
-    test_step_1_list_databases()
-    test_step_2_list_tables_valid_db()
-    test_step_3_get_schema_valid_table()
-    test_step_4_execute_simple_select()
-    test_step_5_execute_parameterized_select()
-    print("\n--- Complex / Edge Cases ---")
-    test_step_6_list_tables_nonexistent_db()
-    test_step_7_get_schema_nonexistent_table()
-    test_step_8_execute_complex_join()
-    test_step_9_execute_aggregation()
-    test_step_10_execute_param_empty_string()
-    test_step_11_execute_param_mismatch()
-    test_step_12_execute_show_command()
-    print("\nManual test descriptions complete.")
+    unittest.main(verbosity=2)
