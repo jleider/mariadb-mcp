@@ -1,38 +1,104 @@
-# MariaDB Ops Server MCP Tool Tests
+# MariaDB MCP Server Tests
 
-This directory contains artifacts related to testing the MariaDB Ops Server MCP (Model Context Protocol) tools.
+## Running the tests
 
-## Purpose
+From the repository root:
 
-The primary goal of these tests was to verify the basic functionality and robustness of the read-only operations provided by the MariaDB MCP server tools:
+```bash
+# Unit tests only (no database needed) — integration tests skip automatically
+python -m unittest discover -s src/tests -t .
 
--   `mcp0_list_databases`
--   `mcp0_list_tables`
--   `mcp0_get_table_schema`
--   `mcp0_execute_sql`
+# Everything, including integration tests
+docker compose -f docker-compose.test.yml up -d --wait
+python -m unittest discover -s src/tests -t .
+docker compose -f docker-compose.test.yml down
+```
 
-## Execution Method
+Run the suite from the repository root, not from `src/`. `src/tests/__init__.py`
+puts `src/` on `sys.path` so that `server.py`'s flat imports (`from config
+import ...`) resolve while the tests import `src.server`.
 
-Tests were performed **manually** via the AI Assistant interface. The interface invoked the MCP tools directly based on user requests, and the results (or errors) were observed in the assistant's responses.
+## Continuous integration
 
-From there, tests were converted into code in test_mariadb_mcp_tools.py`. We use the python `unittest` framework to structure the tests. Note that the environment variables are still used in the unit tests, and a live mariadb server is required to run the tests currently.
+`.github/workflows/tests.yml` runs on every push to `main` and on every pull
+request. The `pull_request` trigger is deliberately unfiltered, so stacked pull
+requests that target a feature branch instead of `main` still get checked.
 
-## Test Cases
+Two jobs:
 
-The specific test cases executed are documented in the `test_mariadb_mcp_tools.py` script within this directory. This script serves as a record of the manual tests performed and includes:
+-   **Unit tests (no database)** — runs the suite with no container and no `REQUIRE_TEST_DATABASE`, asserting the integration tests skip cleanly. This is the documented experience for a contributor without Docker, so it is checked rather than assumed.
+-   **Full suite** — brings up `docker-compose.test.yml` and runs everything with `REQUIRE_TEST_DATABASE=1`.
 
-1.  **Basic Functionality Tests:** Verifying core operations like listing databases/tables, getting schema, and executing simple SELECTs.
-2.  **Complex/Edge Case Tests:** Checking behavior with:
-    *   Non-existent databases/tables
-    *   Complex SQL (JOINs, Aggregations)
-    *   Parameterized queries with edge-case values (empty strings)
-    *   Parameter count mismatches
-    *   `SHOW` commands (including necessary wildcard escaping)
+CI uses the same compose file you run locally, so the two cannot drift.
 
-## Summary of Results
+### `REQUIRE_TEST_DATABASE`
 
-All tests executed as expected. The tools successfully performed the requested read-only operations and provided appropriate error messages for invalid inputs or non-existent objects. The `mcp0_execute_sql` tool required correct escaping (`%%`) for literal `%` signs in `LIKE` clauses when used with `SHOW` commands.
+Because integration tests skip when the database is unreachable, a container
+that failed to start would otherwise leave CI **green while verifying almost
+nothing**. Setting `REQUIRE_TEST_DATABASE=1` makes that condition raise instead
+of skip:
 
-## `test_mariadb_mcp_tools.py`
+| Database | `REQUIRE_TEST_DATABASE` | Exit code |
+| --- | --- | --- |
+| healthy | `1` | 0 |
+| unavailable | `1` | 1 — hard failure |
+| unavailable | unset | 0 — skips, for local work without Docker |
 
-This Python script outlines the tests performed. It is **not** an automated test suite but rather a structured documentation of the manual steps and observed outcomes. It cannot be run independently to interact with the MCP tools.
+The workflow waits with `docker compose up -d --wait`, which blocks on the
+healthcheck. Plain `up -d` returns before MariaDB accepts connections and would
+trip the guard.
+
+Both jobs install with `uv sync --frozen`, so they use exactly the versions
+pinned in the committed `uv.lock` and fail if that lockfile has drifted from
+`pyproject.toml`. An unrelated upstream release therefore cannot break an
+unrelated pull request.
+
+## Layout
+
+| File | Needs a database | What it covers |
+| --- | --- | --- |
+| `test_table_schema_comments.py` | No (mocked) | Schema-tool logic in isolation: comment handling, validation, error paths, field mapping |
+| `test_list_databases_unittest.py` | No (mocked) | `list_databases` |
+| `test_integration_schema_comments.py` | Yes | Table/column comments against a real schema (DL-5840) |
+| `test_mcp_server.py` | Yes | All six tools through a fastmcp client, plus read-only enforcement |
+| `test_mariadb_mcp_tools.py` | Yes | Tool behaviour called directly: SQL execution, joins, aggregation, parameter edge cases |
+| `smoke_test.py` | Yes | Standalone sanity check; run directly, not collected by `unittest` |
+| `support.py` | — | Shared integration fixtures, the skip-if-unavailable probe, and the `REQUIRE_TEST_DATABASE` guard |
+| `fixtures/01-test-schema.sql` | — | Schema loaded into the test container |
+
+## The test database
+
+`docker-compose.test.yml` runs MariaDB 11 on host port **3307**, so it never
+collides with a local server on 3306. Storage is `tmpfs`, so every `up` starts
+from an empty data directory and re-applies `fixtures/01-test-schema.sql`. The
+healthcheck waits for the fixture tables, so `--wait` does not return early.
+
+Connection details default to that container and can be overridden with
+`TEST_DB_HOST`, `TEST_DB_PORT`, `TEST_DB_USER`, `TEST_DB_PASSWORD`,
+`TEST_DB_NAME` and `TEST_DB_OTHER_NAME`. Note that the integration tests do
+**not** read `.env`; they patch the settings that `server.py` binds at import
+time, so they never touch a real database by accident.
+
+When the container is not reachable, integration tests skip with a message
+telling you how to start it, rather than failing. Set `REQUIRE_TEST_DATABASE=1`
+to turn that skip into a hard failure — see below.
+
+## What the fixture schema is for
+
+Each object exists to pin down a specific behaviour:
+
+-   `documented` — every column commented, plus one deliberately uncommented column, a `DEFAULT`, and a foreign key
+-   `undocumented` — no comments anywhere; everything must come back as `''`
+-   `column_defaults` — every shape of column default, because `INFORMATION_SCHEMA.COLUMN_DEFAULT` returns SQL literals (`'active'`) and the string `NULL` for "no default", all of which get decoded back to plain values
+-   `with_comment_column` — has a column literally named `comment`, which is why `get_table_schema` nests columns under `columns` instead of returning them flat
+-   `documented_view` — MariaDB reports `TABLE_COMMENT` as the literal string `'VIEW'` for views, which must be suppressed rather than surfaced as documentation
+-   `parents` — foreign-key target, and a table with no FKs of its own
+-   `mcp_test_other.documented` — same table and column names as `mcp_test.documented` but different comments, so a lookup that forgot `TABLE_SCHEMA` returns visibly wrong text
+
+## Known behaviour pinned by tests
+
+`execute_sql` passes `params or ()` to the driver. An empty tuple is not
+`None`, so the driver applies `%`-formatting even when no parameters were
+supplied, and a literal `%` must be doubled: `SHOW VARIABLES LIKE 'version%%'`
+works, `'version%'` raises. `test_step_12*` pins both halves of this. Changing
+it would silently alter what `%%` means for callers already escaping it.

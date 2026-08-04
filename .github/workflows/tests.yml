@@ -1,0 +1,84 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  # Deliberately unfiltered: stacked pull requests target a feature branch
+  # rather than main, and a `branches: [main]` filter would skip them.
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests (no database)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # --frozen installs exactly what uv.lock pins and fails if the lockfile
+      # is out of date with pyproject.toml, so CI is reproducible and a stale
+      # lockfile is caught rather than silently re-resolved.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # No database and no REQUIRE_TEST_DATABASE, so the integration tests must
+      # skip cleanly. This is the documented experience for a contributor
+      # without Docker, so it is worth asserting rather than assuming.
+      - name: Run suite with no database available
+        run: uv run python -m unittest discover -s src/tests -t . -v
+
+  integration:
+    name: Full suite (MariaDB via docker compose)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # --frozen installs exactly what uv.lock pins and fails if the lockfile
+      # is out of date with pyproject.toml, so CI is reproducible and a stale
+      # lockfile is caught rather than silently re-resolved.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Reuses the same compose file contributors run locally, so CI and local
+      # runs cannot drift. `--wait` blocks on the healthcheck, which queries the
+      # fixture tables rather than just pinging the server.
+      - name: Start test database
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Run full suite
+        env:
+          # Turns "database unavailable" into a failure instead of a skip, so a
+          # broken container cannot leave this job green.
+          REQUIRE_TEST_DATABASE: "1"
+        run: uv run python -m unittest discover -s src/tests -t . -v
+
+      - name: Test database logs
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs --no-color mariadb-test
+
+      - name: Stop test database
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v

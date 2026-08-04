@@ -45,7 +45,12 @@ async def main():
             "get_table_schema",
             {"database_name": "information_schema", "table_name": "TABLES"})))
         assert isinstance(schema, dict), schema
-        print(f"[ok] get_table_schema(information_schema.TABLES)")
+        assert schema["table_name"] == "TABLES", schema
+        assert isinstance(schema["comment"], str), schema
+        assert schema["columns"], schema
+        assert all("comment" in c for c in schema["columns"].values()), schema
+        print(f"[ok] get_table_schema(information_schema.TABLES) -> "
+              f"{len(schema['columns'])} columns, comments present")
 
         # execute_sql
         rows = json.loads(_text(await client.call_tool(

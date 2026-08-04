@@ -157,6 +157,83 @@ class MariaDBServer:
             logger.error(f"Error checking if database '{database_name}' exists: {e}", exc_info=True)
             return False
         
+    # Single query for everything get_table_schema needs: column definitions,
+    # column comments and the table-level comment. A LEFT JOIN from TABLES means
+    # a missing table yields no rows at all (so existence needs no extra probe),
+    # while a table with no readable columns still yields its TABLE_COMMENT.
+    _TABLE_METADATA_SQL = """
+    SELECT
+        c.COLUMN_NAME    as column_name,
+        c.COLUMN_TYPE    as column_type,
+        c.IS_NULLABLE    as is_nullable,
+        c.COLUMN_KEY     as column_key,
+        c.COLUMN_DEFAULT as column_default,
+        c.EXTRA          as extra,
+        c.COLUMN_COMMENT as column_comment,
+        t.TABLE_TYPE     as table_type,
+        t.TABLE_COMMENT  as table_comment
+    FROM information_schema.TABLES t
+    LEFT JOIN information_schema.COLUMNS c
+           ON c.TABLE_SCHEMA = t.TABLE_SCHEMA
+          AND c.TABLE_NAME   = t.TABLE_NAME
+    WHERE t.TABLE_SCHEMA = %s AND t.TABLE_NAME = %s
+    ORDER BY c.ORDINAL_POSITION
+    """
+
+    # MySQL/MariaDB escape sequences that may appear inside a quoted default.
+    _DEFAULT_ESCAPES = {
+        '0': '\0', 'b': '\b', 'n': '\n', 'r': '\r',
+        't': '\t', 'Z': '\x1a', "'": "'", '"': '"', '\\': '\\',
+    }
+
+    @classmethod
+    def _normalize_column_default(cls, value: Optional[str]) -> Optional[str]:
+        """
+        Converts an INFORMATION_SCHEMA.COLUMN_DEFAULT into the value DESCRIBE
+        reports, so switching sources does not change what callers see.
+
+        COLUMN_DEFAULT holds a SQL literal: string defaults arrive quoted
+        ("'active'"), and a column with no default arrives as the unquoted
+        string "NULL" rather than SQL NULL. Numeric defaults ("5") and
+        expressions ("current_timestamp()") are already unquoted and pass
+        through untouched. The quoting is what disambiguates a real string
+        default of "NULL" ("'NULL'") from no default at all ("NULL").
+        """
+        if value is None or value == 'NULL':
+            return None
+        if len(value) >= 2 and value.startswith("'") and value.endswith("'"):
+            inner = value[1:-1]
+            out = []
+            i = 0
+            while i < len(inner):
+                char = inner[i]
+                if char == "'" and inner[i + 1:i + 2] == "'":
+                    out.append("'")
+                    i += 2
+                elif char == '\\' and i + 1 < len(inner):
+                    nxt = inner[i + 1]
+                    out.append(cls._DEFAULT_ESCAPES.get(nxt, nxt))
+                    i += 2
+                else:
+                    out.append(char)
+                    i += 1
+            return ''.join(out)
+        return value
+
+    @staticmethod
+    def _table_comment_from(row: Dict[str, Any]) -> str:
+        """
+        Reads the table-level comment from a metadata row.
+
+        MariaDB reports TABLE_COMMENT as the literal string 'VIEW' for views and
+        offers no COMMENT clause on CREATE VIEW, so that placeholder is not
+        documentation and must not be surfaced as such.
+        """
+        comment = row.get('table_comment') or ''
+        if row.get('table_type') == 'VIEW' and comment == 'VIEW':
+            return ''
+        return comment
+
     # --- MCP Tool Definitions ---
 
     async def list_databases(self) -> List[str]:
@@ -190,8 +267,12 @@ class MariaDBServer:
 
     async def get_table_schema(self, database_name: str, table_name: str) -> Dict[str, Any]:
         """
-        Retrieves the schema (column names, types, nullability, keys, default values)
-        for a specific table in a database.
+        Retrieves the schema (column names, types, nullability, keys, default values,
+        comments) for a specific table in a database, plus the table-level comment.
+
+        Returns {'table_name': ..., 'comment': ..., 'columns': {col_name: {...}}}.
+        Columns are nested under 'columns' because a table may itself have a column
+        named 'comment' (e.g. information_schema.STATISTICS).
         """
         logger.info(f"TOOL START: get_table_schema called. database_name={database_name}, table_name={table_name}")
         if not database_name or not database_name.isidentifier():
@@ -201,31 +282,37 @@ class MariaDBServer:
             logger.warning(f"TOOL WARNING: get_table_schema called with invalid table_name: {table_name}")
             raise ValueError(f"Invalid table name provided: {table_name}")
 
-        sql = f"DESCRIBE `{database_name}`.`{table_name}`"
         try:
-            schema_results = await self._execute_query(sql)
-            schema_info = {}
-            if not schema_results:
-                exists_sql = "SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = %s AND table_name = %s"
-                exists_result = await self._execute_query(exists_sql, params=(database_name, table_name))
-                if not exists_result or exists_result[0]['count'] == 0:
-                    logger.warning(f"TOOL WARNING: Table '{database_name}'.'{table_name}' not found or inaccessible.")
-                    raise FileNotFoundError(f"Table '{database_name}'.'{table_name}' not found or inaccessible.")
-                else:
-                    logger.warning(f"Could not describe table '{database_name}'.'{table_name}'. It might be a view or lack permissions.")
+            metadata_rows = await self._execute_query(
+                self._TABLE_METADATA_SQL, params=(database_name, table_name)
+            )
+            if not metadata_rows:
+                logger.warning(f"TOOL WARNING: Table '{database_name}'.'{table_name}' not found or inaccessible.")
+                raise FileNotFoundError(f"Table '{database_name}'.'{table_name}' not found or inaccessible.")
 
-            for row in schema_results:
-                col_name = row.get('Field')
+            schema_info = {}
+            for row in metadata_rows:
+                col_name = row.get('column_name')
                 if col_name:
                     schema_info[col_name] = {
-                        'type': row.get('Type'),
-                        'nullable': row.get('Null', '').upper() == 'YES',
-                        'key': row.get('Key'),
-                        'default': row.get('Default'),
-                        'extra': row.get('Extra')
+                        'type': row.get('column_type'),
+                        'nullable': (row.get('is_nullable') or '').upper() == 'YES',
+                        'key': row.get('column_key'),
+                        'default': self._normalize_column_default(row.get('column_default')),
+                        'extra': row.get('extra'),
+                        'comment': row.get('column_comment') or ''
                     }
+
+            if not schema_info:
+                logger.warning(f"Table '{database_name}'.'{table_name}' exposed no columns. It might lack permissions.")
+
+            result = {
+                'table_name': table_name,
+                'comment': self._table_comment_from(metadata_rows[0]),
+                'columns': schema_info
+            }
             logger.info(f"TOOL END: get_table_schema completed. Columns found: {len(schema_info)}. Keys: {list(schema_info.keys())}")
-            return schema_info
+            return result
         except FileNotFoundError as e:
             logger.warning(f"TOOL WARNING: get_table_schema table not found: {e}")
             raise e
@@ -236,7 +323,8 @@ class MariaDBServer:
     async def get_table_schema_with_relations(self, database_name: str, table_name: str) -> Dict[str, Any]:
         """
         Retrieves table schema with foreign key relationship information.
-        Includes all basic schema info plus foreign key relationships and referenced tables.
+        Includes all basic schema info (types, nullability, keys, defaults, comments)
+        plus the table-level comment, foreign key relationships and referenced tables.
         """
         logger.info(f"TOOL START: get_table_schema_with_relations called. database_name={database_name}, table_name={table_name}")
         if not database_name or not database_name.isidentifier():
@@ -247,8 +335,9 @@ class MariaDBServer:
             raise ValueError(f"Invalid table name provided: {table_name}")
 
         try:
-            # 1. Get basic schema information
+            # 1. Get basic schema information (includes column and table comments)
             basic_schema = await self.get_table_schema(database_name, table_name)
+            basic_columns = basic_schema['columns']
             
             # 2. Retrieve foreign key information
             fk_sql = """
@@ -273,7 +362,7 @@ class MariaDBServer:
             
             # 3. Add foreign key information to the basic schema
             enhanced_schema = {}
-            for col_name, col_info in basic_schema.items():
+            for col_name, col_info in basic_columns.items():
                 enhanced_schema[col_name] = col_info.copy()
                 enhanced_schema[col_name]['foreign_key'] = None
             
@@ -292,6 +381,7 @@ class MariaDBServer:
             # 5. Return the enhanced schema with foreign key relations
             result = {
                 'table_name': table_name,
+                'comment': basic_schema['comment'],
                 'columns': enhanced_schema
             }
             
@@ -369,12 +459,14 @@ class MariaDBServer:
             
         @self.mcp.tool
         async def get_table_schema(database_name: str, table_name: str) -> Dict[str, Any]:
-            """Retrieves the schema for a specific table in a database."""
+            """Retrieves the schema for a specific table in a database, including the
+            table-level comment and a per-column comment documenting each column."""
             return await self.get_table_schema(database_name, table_name)
             
         @self.mcp.tool
         async def get_table_schema_with_relations(database_name: str, table_name: str) -> Dict[str, Any]:
-            """Retrieves table schema with foreign key relationship information."""
+            """Retrieves table schema with foreign key relationship information, including
+            the table-level comment and a per-column comment documenting each column."""
             return await self.get_table_schema_with_relations(database_name, table_name)
             
         @self.mcp.tool

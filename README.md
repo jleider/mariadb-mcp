@@ -47,12 +47,15 @@ The MCP MariaDB Server exposes a set of tools for interacting with MariaDB datab
   - Parameters: `database_name` (string, required)
 
 - **get_table_schema**
-  - Retrieves schema for a table (columns, types, keys, etc.).
+  - Retrieves schema for a table (columns, types, keys, etc.), including the table-level `COMMENT` and each column's `COMMENT`.
   - Parameters: `database_name` (string, required), `table_name` (string, required)
+  - Returns: `{"table_name": ..., "comment": ..., "columns": {"<col>": {"type", "nullable", "key", "default", "extra", "comment"}}}`. Columns are nested under `columns` because a table may itself have a column named `comment`. Tables and columns without a comment return an empty string, and columns with no default return `null`.
+  - Everything is read from `INFORMATION_SCHEMA` in a single query. Column order follows `ORDINAL_POSITION`.
 
 - **get_table_schema_with_relations**
-  - Retrieves schema with foreign key relations for a table.
+  - Retrieves schema with foreign key relations for a table, including the table-level `COMMENT` and each column's `COMMENT`.
   - Parameters: `database_name` (string, required), `table_name` (string, required)
+  - Returns: the same shape as `get_table_schema`, with an added `foreign_key` field per column (`null` when the column is not a foreign key). Uses two queries.
 
 - **execute_sql**
   - Executes a read-only SQL query (`SELECT`, `SHOW`, `DESCRIBE`).
@@ -110,11 +113,9 @@ MCP_MAX_POOL_SIZE=10
    ```
 3. **Install dependencies**
    ```bash
-   uv pip compile pyproject.toml -o uv.lock
+   uv sync --frozen
    ```
-   ```bash
-   uv pip sync uv.lock
-   ```
+   `uv.lock` is committed, so this installs the exact pinned versions CI uses. Do not run `uv pip compile -o uv.lock`: that writes a pip-style requirements file over the `uv lock` TOML lockfile. To change a dependency, edit `pyproject.toml` and run `uv lock`.
 4. **Create `.env`** in the project root (see [Configuration](#configuration--environment-variables))
 5. **Run the server**
    
@@ -208,6 +209,18 @@ MCP_MAX_POOL_SIZE=10
 
 ## Testing
 
-- Tests are located in the `src/tests/` directory.
-- See `src/tests/README.md` for an overview.
-- Tests cover standard SQL tool operations.
+Tests live in `src/tests/`. Run them from the repository root.
+
+Unit tests are fully mocked and need no database. Integration tests run against a disposable MariaDB container and skip with an explanatory message when it is not running, so the default command stays green without Docker:
+
+```bash
+# Unit tests only; integration tests skip
+python -m unittest discover -s src/tests -t .
+
+# Everything, including integration tests
+docker compose -f docker-compose.test.yml up -d --wait
+python -m unittest discover -s src/tests -t .
+docker compose -f docker-compose.test.yml down
+```
+
+The test container listens on host port **3307** so it does not collide with a local MariaDB on 3306, and loads the fixture schema in `src/tests/fixtures/01-test-schema.sql`. The integration tests do not read `.env`, so they cannot touch a real database by accident. See `src/tests/README.md` for the fixture layout and the connection overrides.
