@@ -95,10 +95,16 @@ Each object exists to pin down a specific behaviour:
 -   `parents` — foreign-key target, and a table with no FKs of its own
 -   `mcp_test_other.documented` — same table and column names as `mcp_test.documented` but different comments, so a lookup that forgot `TABLE_SCHEMA` returns visibly wrong text
 
-## Known behaviour pinned by tests
+## Literal `%` handling, pinned by tests
 
-`execute_sql` passes `params or ()` to the driver. An empty tuple is not
-`None`, so the driver applies `%`-formatting even when no parameters were
-supplied, and a literal `%` must be doubled: `SHOW VARIABLES LIKE 'version%%'`
-works, `'version%'` raises. `test_step_12*` pins both halves of this. Changing
-it would silently alter what `%%` means for callers already escaping it.
+The driver applies `%`-formatting only when its `args` is not `None`, so
+`_execute_query` forwards `params` unchanged rather than collapsing `None` to an
+empty tuple. Consequences, all covered by `TestLiteralPercentHandling` in
+`test_mariadb_mcp_tools.py`:
+
+-   With no parameters, the SQL reaches the server verbatim, so `LIKE '%foo%'` and `SELECT '100%'` work with no escaping
+-   With parameters, `%s` binding applies and a literal `%` must be doubled — the standard DB-API `format` paramstyle
+-   `%%` inside a `LIKE` pattern is unaffected either way, since SQL treats it as two consecutive zero-or-more wildcards, the same match as a single `%`
+
+`TestExecuteQueryParameterPassing` in `test_table_schema_comments.py` guards the
+`None`-vs-`()` distinction at the driver boundary without needing a database.

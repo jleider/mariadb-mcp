@@ -60,6 +60,7 @@ The MCP MariaDB Server exposes a set of tools for interacting with MariaDB datab
 - **execute_sql**
   - Executes a read-only SQL query (`SELECT`, `SHOW`, `DESCRIBE`).
   - Parameters: `sql_query` (string, required), `database_name` (string, optional), `parameters` (list, optional)
+  - Placeholders are `%s`, bound from `parameters`. When you pass `parameters`, a literal `%` in the SQL must be doubled (`LIKE '%%foo%%'`) — the standard DB-API `format` paramstyle. With no `parameters`, the query is sent verbatim and `%` needs no escaping (`LIKE '%foo%'`). Prefer putting wildcards in the bound value: `LIKE %s` with `["%foo%"]`.
   - _Note: Enforces read-only mode if `MCP_READ_ONLY` is enabled._
   
 - **create_database**

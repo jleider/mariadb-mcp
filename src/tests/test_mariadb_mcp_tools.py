@@ -151,14 +151,19 @@ class TestMariaDBMCPTools(MariaDBIntegrationTestCase):
             )
 
     async def test_step_12_execute_show_command(self):
-        """
-        SHOW works, but a literal '%' must be doubled.
+        """SHOW works, and a literal '%' needs no escaping without parameters."""
+        rows = await self.server.execute_sql(
+            "SHOW VARIABLES LIKE 'version%'", TEST_DB_NAME)
 
-        `_execute_query` passes `params or ()` to the driver, and an empty tuple
-        is not None, so the driver still applies %-formatting even when the
-        caller supplied no parameters. Pinning this behaviour deliberately: the
-        alternative (passing None) would silently change what '%%' means for
-        callers already escaping it.
+        variables = {row['Variable_name'] for row in rows}
+        self.assertIn('version', variables)
+
+    async def test_step_12b_doubled_percent_still_works_in_like(self):
+        """
+        `%%` in a LIKE pattern keeps working, because SQL treats it as two
+        consecutive zero-or-more wildcards — the same match as a single `%`.
+        Callers who doubled `%` to work around the old formatting bug are
+        unaffected.
         """
         rows = await self.server.execute_sql(
             "SHOW VARIABLES LIKE 'version%%'", TEST_DB_NAME)
@@ -166,11 +171,61 @@ class TestMariaDBMCPTools(MariaDBIntegrationTestCase):
         variables = {row['Variable_name'] for row in rows}
         self.assertIn('version', variables)
 
-    async def test_step_12b_single_percent_without_params_fails(self):
-        """Documents the escaping requirement above."""
+
+class TestLiteralPercentHandling(MariaDBIntegrationTestCase):
+    """
+    A query with no parameters is sent to the server verbatim, so `%` is a
+    plain character. Once parameters are supplied, `%s` binding applies and a
+    literal `%` must be doubled — the standard DB-API `format` paramstyle.
+    """
+
+    async def test_like_wildcard_needs_no_escaping_without_parameters(self):
+        """The idiom that the old `params or ()` behaviour broke outright."""
+        rows = await self.server.execute_sql(
+            "SELECT TABLE_NAME FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = '{TEST_DB_NAME}' AND TABLE_NAME LIKE '%documented%'",
+            TEST_DB_NAME,
+        )
+
+        names = {row['TABLE_NAME'] for row in rows}
+        self.assertEqual(names, {'documented', 'undocumented', 'documented_view'})
+
+    async def test_literal_percent_in_string_is_returned_intact(self):
+        rows = await self.server.execute_sql("SELECT '100%' AS pct", TEST_DB_NAME)
+
+        self.assertEqual(rows[0]['pct'], '100%')
+
+    async def test_percent_in_like_pattern_expression(self):
+        rows = await self.server.execute_sql(
+            "SELECT 'a%b' LIKE 'a%%b' AS matched", TEST_DB_NAME)
+
+        self.assertEqual(rows[0]['matched'], 1)
+
+    async def test_wildcard_passed_as_a_bound_parameter(self):
+        """The preferred form: the wildcard travels in the value, not the SQL."""
+        rows = await self.server.execute_sql(
+            'SELECT TABLE_NAME FROM information_schema.TABLES '
+            'WHERE TABLE_SCHEMA = %s AND TABLE_NAME LIKE %s',
+            TEST_DB_NAME,
+            [TEST_DB_NAME, '%documented%'],
+        )
+
+        names = {row['TABLE_NAME'] for row in rows}
+        self.assertEqual(names, {'documented', 'undocumented', 'documented_view'})
+
+    async def test_literal_percent_must_be_doubled_when_parameters_are_used(self):
+        """Standard `format` paramstyle behaviour, unchanged by the fix."""
+        rows = await self.server.execute_sql(
+            "SELECT '100%%' AS pct, %s AS bound", TEST_DB_NAME, ['x'])
+
+        self.assertEqual(rows[0]['pct'], '100%')
+        self.assertEqual(rows[0]['bound'], 'x')
+
+    async def test_single_percent_with_parameters_still_raises(self):
+        """An unescaped `%` alongside `%s` is a genuine caller error."""
         with self.assertRaises(Exception):
             await self.server.execute_sql(
-                "SHOW VARIABLES LIKE 'version%'", TEST_DB_NAME)
+                "SELECT '100%' AS pct, %s AS bound", TEST_DB_NAME, ['x'])
 
 
 if __name__ == "__main__":

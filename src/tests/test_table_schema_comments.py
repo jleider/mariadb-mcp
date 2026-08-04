@@ -581,5 +581,86 @@ class TestOtherToolCoverage(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.server._database_exists('BondLink'))
 
 
+# --------------------------------------------------------------------------
+# _execute_query parameter passing
+# --------------------------------------------------------------------------
+
+class _FakeCursor:
+    """Records execute() calls; stands in for an asyncmy DictCursor."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def execute(self, sql, args=None):
+        self.calls.append((sql, args))
+
+    async def fetchone(self):
+        return {'DATABASE()': 'testdb'}
+
+    async def fetchall(self):
+        return []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def cursor(self, cursor=None):
+        return self._cursor
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakePool:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def acquire(self):
+        return self._connection
+
+
+class TestExecuteQueryParameterPassing(unittest.IsolatedAsyncioTestCase):
+    """
+    The driver applies %-formatting only when args is not None, so "no
+    parameters" must reach it as None. Passing an empty tuple instead formats a
+    query with nothing to substitute, which breaks every literal '%' — including
+    LIKE '%foo%'. Guards that regression without needing a database.
+    """
+
+    async def asyncSetUp(self):
+        self.server = MariaDBServer()
+        self.server.is_read_only = False
+        self.cursor = _FakeCursor()
+        self.server.pool = _FakePool(_FakeConnection(self.cursor))
+
+    async def test_no_parameters_reaches_the_driver_as_none(self):
+        await self.server._execute_query("SELECT '100%' AS pct")
+
+        sql, args = self.cursor.calls[-1]
+        self.assertEqual(sql, "SELECT '100%' AS pct")
+        self.assertIsNone(args, "empty tuple would re-enable %-formatting")
+
+    async def test_supplied_parameters_are_forwarded_unchanged(self):
+        await self.server._execute_query('SELECT %s', params=('a',))
+
+        self.assertEqual(self.cursor.calls[-1], ('SELECT %s', ('a',)))
+
+    async def test_empty_tuple_is_forwarded_as_given(self):
+        """An explicitly empty tuple is the caller's choice, not None."""
+        await self.server._execute_query('SELECT 1', params=())
+
+        self.assertEqual(self.cursor.calls[-1], ('SELECT 1', ()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
