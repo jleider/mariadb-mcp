@@ -121,7 +121,11 @@ class MariaDBServer:
                         logger.info(f"Switching database context from '{actual_current_db}' to '{database}'")
                         await cursor.execute(f"USE `{database}`")
 
-                    await cursor.execute(sql, params or ())
+                    # Pass params through as-is: the driver applies %-formatting
+                    # only when args is not None, so collapsing None to () would
+                    # format a query that has no values to substitute, breaking
+                    # every literal '%' (notably LIKE '%foo%').
+                    await cursor.execute(sql, params)
                     results = await cursor.fetchall()
                     logger.info(f"Query executed successfully, {len(results)} rows returned.")
                     return results if results else []
