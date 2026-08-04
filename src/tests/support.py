@@ -29,6 +29,13 @@ _SKIP_MESSAGE = (
     "docker compose -f docker-compose.test.yml up -d --wait"
 )
 
+# Set REQUIRE_TEST_DATABASE=1 where the database is supposed to be present (CI).
+# Skipping is the right default locally, but in CI a container that fails to
+# start would otherwise leave the build green with every integration test
+# skipped — passing while verifying almost nothing.
+REQUIRE_TEST_DATABASE = os.getenv(
+    "REQUIRE_TEST_DATABASE", "").strip().lower() not in ("", "0", "false", "no")
+
 # Cache the probe result so a missing container costs one connection attempt
 # for the whole run rather than one per test.
 _availability = None
@@ -62,11 +69,20 @@ async def _probe() -> bool:
 
 
 async def skip_unless_test_database():
-    """Raises SkipTest unless the fixture database is reachable."""
+    """
+    Raises SkipTest unless the fixture database is reachable.
+
+    With REQUIRE_TEST_DATABASE set, raises RuntimeError instead so the run fails
+    loudly rather than skipping.
+    """
     global _availability
     if _availability is None:
         _availability = await _probe()
     if not _availability:
+        if REQUIRE_TEST_DATABASE:
+            raise RuntimeError(
+                f"REQUIRE_TEST_DATABASE is set, so skipping is not allowed. {_SKIP_MESSAGE}"
+            )
         raise unittest.SkipTest(_SKIP_MESSAGE)
 
 
