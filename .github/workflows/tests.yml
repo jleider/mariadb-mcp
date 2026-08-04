@@ -28,8 +28,11 @@ jobs:
         with:
           enable-cache: true
 
+      # --frozen installs exactly what uv.lock pins and fails if the lockfile
+      # is out of date with pyproject.toml, so CI is reproducible and a stale
+      # lockfile is caught rather than silently re-resolved.
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --frozen
 
       # No database and no REQUIRE_TEST_DATABASE, so the integration tests must
       # skip cleanly. This is the documented experience for a contributor
@@ -53,8 +56,11 @@ jobs:
         with:
           enable-cache: true
 
+      # --frozen installs exactly what uv.lock pins and fails if the lockfile
+      # is out of date with pyproject.toml, so CI is reproducible and a stale
+      # lockfile is caught rather than silently re-resolved.
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --frozen
 
       # Reuses the same compose file contributors run locally, so CI and local
       # runs cannot drift. `--wait` blocks on the healthcheck, which queries the

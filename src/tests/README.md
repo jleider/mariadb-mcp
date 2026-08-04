@@ -48,9 +48,10 @@ The workflow waits with `docker compose up -d --wait`, which blocks on the
 healthcheck. Plain `up -d` returns before MariaDB accepts connections and would
 trip the guard.
 
-Note that `uv.lock` is gitignored, so CI resolves dependencies fresh on every
-run. Committing the lockfile would make builds reproducible and stop an
-unrelated upstream release from breaking an unrelated pull request.
+Both jobs install with `uv sync --frozen`, so they use exactly the versions
+pinned in the committed `uv.lock` and fail if that lockfile has drifted from
+`pyproject.toml`. An unrelated upstream release therefore cannot break an
+unrelated pull request.
 
 ## Layout
 

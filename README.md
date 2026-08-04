@@ -113,11 +113,9 @@ MCP_MAX_POOL_SIZE=10
    ```
 3. **Install dependencies**
    ```bash
-   uv pip compile pyproject.toml -o uv.lock
+   uv sync --frozen
    ```
-   ```bash
-   uv pip sync uv.lock
-   ```
+   `uv.lock` is committed, so this installs the exact pinned versions CI uses. Do not run `uv pip compile -o uv.lock`: that writes a pip-style requirements file over the `uv lock` TOML lockfile. To change a dependency, edit `pyproject.toml` and run `uv lock`.
 4. **Create `.env`** in the project root (see [Configuration](#configuration--environment-variables))
 5. **Run the server**
    
