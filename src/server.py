@@ -72,6 +72,9 @@ class MariaDBServer:
         if self.pool:
             logger.info("Closing database connection pool...")
             try:
+                # clear() is asyncmy's only COM_QUIT path; once close() sets _closing,
+                # wait_closed() and release() drop the socket and the server logs an abort.
+                await self.pool.clear()
                 self.pool.close()
                 await self.pool.wait_closed()
                 logger.info("Database connection pool closed.")

@@ -65,7 +65,9 @@ async def _probe() -> bool:
     except Exception:
         return False
     finally:
-        conn.close()
+        # ensure_closed() sends COM_QUIT; close() just drops the socket, which the
+        # server logs as an aborted connection.
+        await conn.ensure_closed()
 
 
 async def skip_unless_test_database():
