@@ -5,7 +5,7 @@ description = "MariaDB MCP Server"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "asyncmy>=0.2.11",
-    "fastmcp>=3.4.2",
-    "python-dotenv>=1.2.2",
+    "asyncmy>=0.2.14",
+    "fastmcp>=4.0.3",
+    "python-dotenv>=1.2.3",
 ]
